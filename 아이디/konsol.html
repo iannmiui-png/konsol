@@ -176,7 +176,7 @@ function decodeText(bytes) {
   else if (bytes.length > 1 && bytes[0] === 0xFE && bytes[1] === 0xFF) enc = 'utf-16be';
   let t = new TextDecoder(enc).decode(bytes);
   if (t.charCodeAt(0) === 0xFEFF) t = t.slice(1);
-  return t.replace(/\r\n?/g, '\n');
+  return t.indexOf('\r') < 0 ? t : t.replace(/\r\n?/g, '\n');
 }
 
 // ── A grid straight from text. The PNG format stores a residue mod 40, so it
@@ -185,33 +185,41 @@ function decodeText(bytes) {
 // decomposition, so such a program can still run -- it just cannot be baked.
 // Index 0 is the blank, so a read past a row's end is a no-op.
 function gridFromText(text) {
-  const rows = text.split('\n');
-  if (rows.length && rows[rows.length - 1] === '') rows.pop();
-  if (!rows.length) throw new Error('빈 격자입니다');
-  const idx = new Map([[' ', 0]]);
-  const syms = [' '];
-  let total = 0;
-  for (const r of rows) {
-    if (r.length > 65535) throw new Error('한 행이 65535자를 넘습니다');
-    total += r.length;
-    for (const c of r) if (!idx.has(c)) { idx.set(c, syms.length); syms.push(c); }
+  const n = text.length;
+  // A code-point lookup table, not a Map: the fill pass runs once per cell and
+  // Lost Kingdom is 22 million cells. Index 0 is the blank, so a read past the
+  // end of a row is a no-op.
+  const lut = new Int32Array(0x10000).fill(-1);
+  const syms = [32];
+  lut[32] = 0;
+  let rows = 0, total = 0, W = 0, cur = 0;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 10) { if (cur > W) W = cur; cur = 0; rows++; continue; }
+    cur++; total++;
+    if (c < 0x10000 && lut[c] < 0) { lut[c] = syms.length; syms.push(c); }
   }
-  const Arr = syms.length > 255 ? Uint16Array : Uint8Array;
-  const data = new Arr(total);
-  const rowStart = new Int32Array(rows.length), rowLen = new Uint16Array(rows.length);
-  let w = 0, W = 0;
-  for (let y = 0; y < rows.length; y++) {
-    rowStart[y] = w; rowLen[y] = rows[y].length;
-    if (rows[y].length > W) W = rows[y].length;
-    for (const c of rows[y]) data[w++] = idx.get(c);
+  if (cur) { if (cur > W) W = cur; rows++; }        // file need not end in \n
+  if (!rows) throw new Error('빈 격자입니다');
+  if (W > 65535) throw new Error('한 행이 65535자를 넘습니다');
+
+  const data = new (syms.length > 255 ? Uint16Array : Uint8Array)(total);
+  const rowStart = new Int32Array(rows), rowLen = new Uint16Array(rows);
+  let r = 0, w = 0, st = 0;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 10) { rowStart[r] = st; rowLen[r] = w - st; st = w; r++; continue; }
+    data[w++] = lut[c];
   }
+  if (r < rows) { rowStart[r] = st; rowLen[r] = w - st; }
+
   const cho = new Int8Array(syms.length).fill(-1),
         ju = new Uint8Array(syms.length), jo = new Uint8Array(syms.length);
   for (let i = 0; i < syms.length; i++) {
-    const o = syms[i].charCodeAt(0) - HBASE;
+    const o = syms[i] - HBASE;
     if (o >= 0 && o < 19 * 21 * 28) { cho[i] = (o / 588) | 0; ju[i] = ((o % 588) / 28) | 0; jo[i] = o % 28; }
   }
-  return { data, rowStart, rowLen, rows: rows.length, W, cho, ju, jo, blank: 0 };
+  return { data, rowStart, rowLen, rows, W, cho, ju, jo, blank: 0, syms };
 }
 
 // ── Brainfuck → Aheui grid. Same scaffold as bf_to_aheui.py: leaf blocks are
@@ -427,16 +435,23 @@ function buildGrid(raw) {
 // left untabled -- their glides are short anyway, and a table for column 0
 // alone would cost 33 MB.
 function buildSkip(g) {
-  const {rows, W, cho, data, rowStart, rowLen} = g;
-  const cell = (x, y) => x < rowLen[y] ? data[rowStart[y] + x] : g.blank;
+  const {rows, W, cho, data, rowStart, rowLen, blank} = g;
+  const count = new Int32Array(W);
+  for (let y = 0; y < rows; y++) {
+    const st = rowStart[y], len = rowLen[y];
+    for (let x = 0; x < W; x++)
+      if (cho[x < len ? data[st + x] : blank] >= 0) count[x]++;
+  }
   const tab = new Array(W).fill(null);
-  for (let x = 0; x < W; x++) {
-    let n = 0;
-    for (let y = 0; y < rows; y++) if (cho[cell(x, y)] >= 0) n++;
-    if (n > rows * 0.3 || n === 0) continue;      // dense or empty: skip table
-    const a = new Int32Array(n); let k = 0;
-    for (let y = 0; y < rows; y++) if (cho[cell(x, y)] >= 0) a[k++] = y;
-    tab[x] = a;
+  const fill = new Int32Array(W);
+  for (let x = 0; x < W; x++)
+    if (count[x] && count[x] <= rows * 0.3) tab[x] = new Int32Array(count[x]);
+  for (let y = 0; y < rows; y++) {
+    const st = rowStart[y], len = rowLen[y];
+    for (let x = 0; x < W; x++) {
+      const t = tab[x];
+      if (t && cho[x < len ? data[st + x] : blank] >= 0) t[fill[x]++] = y;
+    }
   }
   return tab;
 }
@@ -614,6 +629,10 @@ function offer(blob, filename, info) {
 // can be baked the same way; one using any other syllable cannot be, because
 // the residue-mod-40 format has no room for it, so it runs straight from text
 // and the page says so rather than failing.
+// Above this, baking in the browser means a pixel array and a deflate pass of
+// the same order again; bf_to_png.py does it without the tab.
+const BAKE_LIMIT = 12000000;
+
 async function load(bytes, name) {
   const isPNG = bytes.length > 8 && bytes[0] === 137 && bytes[1] === 80 &&
                 bytes[2] === 78 && bytes[3] === 71;
@@ -628,21 +647,38 @@ async function load(bytes, name) {
   let grid;
 
   if (/[\uAC00-\uD7A3]/.test(text)) {
-    const outside = new Set();
-    for (const c of text) if (c !== '\n' && ALPHABET.indexOf(c) < 0) outside.add(c);
-    grid = text.endsWith('\n') ? text : text + '\n';
-    if (outside.size) {
-      const list = [...outside].slice(0, 8).join(' ');
-      say(`${name}: 아희 격자 (알파벳 밖의 문자 ${outside.size}종: ${list})\n`, 'echo');
-      say('이 문자들은 PNG의 40진 잔여값으로 저장할 수 없어 텍스트에서 바로 실행합니다.\n\n', 'echo');
-      let g;
-      try { g = gridFromText(grid); }
-      catch (err) { status('격자 오류'); say(`격자 오류: ${err.message}\n`, 'echo'); return; }
-      offer(new Blob([grid], {type: 'text/plain'}), stem + '.aheui',
-            `${g.rows.toLocaleString()}행 × ${g.W}열 · PNG로 굽지 않음`);
+    status('아희 격자 읽는 중…'); await yieldUI();
+    let g;
+    try { g = gridFromText(text); }
+    catch (err) { status('격자 오류'); say(`격자 오류: ${err.message}\n`, 'echo'); return; }
+
+    // Membership is checked against the grid's symbol table, not the text:
+    // there are a few dozen distinct symbols and tens of millions of cells.
+    const outside = [];
+    for (const c of g.syms) {
+      const ch = String.fromCharCode(c);
+      if (ALPHABET.indexOf(ch) < 0) outside.push(ch);
+    }
+    const tooBig = text.length > BAKE_LIMIT;
+
+    if (outside.length || tooBig) {
+      say(`${name}: 아희 격자 ${g.rows.toLocaleString()}행 × ${g.W}열\n`, 'echo');
+      if (outside.length)
+        say(`알파벳 밖의 문자 ${outside.length}종 (${outside.slice(0, 8).join(' ')}) — ` +
+            'PNG의 40진 잔여값으로 저장할 수 없습니다.\n', 'echo');
+      if (tooBig)
+        say(`격자가 ${text.length.toLocaleString()}자로 브라우저에서 굽기에 너무 큽니다 ` +
+            `(한도 ${BAKE_LIMIT.toLocaleString()}자). PNG가 필요하면 bf_to_png.py를 쓰세요.\n`, 'echo');
+      say('텍스트에서 바로 실행합니다.\n\n', 'echo');
+      if (text.length <= 4000000)
+        offer(new Blob([text], {type: 'text/plain'}), stem + '.aheui',
+              `${g.rows.toLocaleString()}행 × ${g.W}열 · PNG로 굽지 않음`);
+      else
+        madeEl.classList.remove('on');
       return runGrid(g, true);
     }
     say(`${name}: 아희 격자로 읽습니다\n`, 'echo');
+    grid = text.endsWith('\n') ? text : text + '\n';
   } else {
     const ops = (text.match(/[+\-.,<>[\]]/g) || []).length;
     if (!ops) { status('브레인퍽 명령이 없습니다'); say(`${name}: 실행할 명령이 없습니다\n`, 'echo'); return; }
